@@ -2,11 +2,14 @@ package helper
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/greenplum-db/gpbackup/toc"
@@ -17,9 +20,17 @@ import (
 /*
  * Restore specific functions
  */
+type ReaderType int
+
+type RestoreReader struct {
+	bufReader		*bufio.Reader
+	isSubsetReader	bool
+}
 
 func doRestoreAgent() error {
-	tocEntries := toc.NewSegmentTOC(*tocFile).DataEntries
+	segmentTOC := toc.NewSegmentTOC(*tocFile)
+	tocEntries := segmentTOC.DataEntries
+
 	var lastByte uint64
 	var bytesRead int64
 	var start uint64
@@ -33,7 +44,7 @@ func doRestoreAgent() error {
 		return err
 	}
 
-	reader, err := getRestoreDataReader()
+	reader, err := getRestoreDataReader(segmentTOC)
 	if err != nil {
 		return err
 	}
@@ -70,7 +81,7 @@ func doRestoreAgent() error {
 		}
 
 		log(fmt.Sprintf("Data Reader - Start Byte: %d; End Byte: %d; Last Byte: %d", start, end, lastByte))
-		numDiscarded, err = reader.Discard(int(start - lastByte))
+		numDiscarded, err = reader.bufReader.Discard(int(start - lastByte))
 		if err != nil {
 			// Always hard quit if data reader has issues
 			_ = utils.RemoveFileIfExists(currentPipe)
@@ -79,7 +90,7 @@ func doRestoreAgent() error {
 		log(fmt.Sprintf("Data Reader discarded %d bytes", numDiscarded))
 
 		log(fmt.Sprintf("Restoring table with oid %d", oid))
-		bytesRead, err = io.CopyN(writer, reader, int64(end-start))
+		bytesRead, err = io.CopyN(writer, reader.bufReader, int64(end-start))
 		if err != nil {
 			// In case COPY FROM or copyN fails in the middle of a load. We
 			// need to update the lastByte with the amount of bytes that was
@@ -120,11 +131,14 @@ func doRestoreAgent() error {
 	return lastError
 }
 
-func getRestoreDataReader() (*bufio.Reader, error) {
+func getRestoreDataReader(tocEntries *toc.SegmentTOC) (*RestoreReader, error) {
+	var restoreReader *RestoreReader
 	var readHandle io.Reader
+	var isSubsetReader bool
 	var err error
+
 	if *pluginConfigFile != "" {
-		readHandle, err = startRestorePluginCommand()
+		readHandle, isSubsetReader, err = startRestorePluginCommand(tocEntries)
 	} else {
 		readHandle, err = os.Open(*dataFile)
 	}
@@ -133,12 +147,12 @@ func getRestoreDataReader() (*bufio.Reader, error) {
 	}
 
 	var bufIoReader *bufio.Reader
-	if strings.HasSuffix(*dataFile, ".gz") {
+	if *compressionLevel > 0 {
 		gzipReader, err := gzip.NewReader(readHandle)
 		if err != nil {
 			return nil, err
 		}
-		bufIoReader = bufio.NewReader(gzipReader)
+		bufIoReader= bufio.NewReader(gzipReader)
 	} else {
 		bufIoReader = bufio.NewReader(readHandle)
 	}
@@ -147,7 +161,9 @@ func getRestoreDataReader() (*bufio.Reader, error) {
 	if len(errMsg) != 0 {
 		return nil, errors.New(errMsg)
 	}
-	return bufIoReader, nil
+	restoreReader.bufReader = bufIoReader
+	restoreReader.isSubsetReader = isSubsetReader
+	return restoreReader, nil
 }
 
 func getRestorePipeWriter(currentPipe string) (*bufio.Writer, *os.File, error) {
@@ -160,21 +176,34 @@ func getRestorePipeWriter(currentPipe string) (*bufio.Writer, *os.File, error) {
 	return pipeWriter, fileHandle, nil
 }
 
-func startRestorePluginCommand() (io.Reader, error) {
+func startRestorePluginCommand(tocEntries *toc.SegmentTOC) (io.Reader, bool, error) {
 	pluginConfig, err := utils.ReadPluginConfig(*pluginConfigFile)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	cmdStr := fmt.Sprintf("%s restore_data %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile)
+	cmdStr := ""
+	isSubset := false
+	if strings.HasPrefix(pluginConfig.ExecutablePath, "gpbackup_ddboost_plugin") && *isFilter && *compressionLevel > 0 {
+		offsetsFile := fmt.Sprintf("/tmp/%s",filepath.Base(*dataFile))
+		wbuf := new(bytes.Buffer)
+		for _, entry := range tocEntries.DataEntries {
+			_ = binary.Write(wbuf, binary.LittleEndian, entry.StartByte)
+			_ = binary.Write(wbuf, binary.LittleEndian, entry.EndByte)
+		}
+		utils.WriteToFileAndMakeReadOnly(offsetsFile, wbuf.Bytes())
+		cmdStr = fmt.Sprintf("%s restore_data_subset %s %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile, offsetsFile)
+		isSubset = true
+	} else {
+		cmdStr = fmt.Sprintf("%s restore_data %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile)
+	}
 	cmd := exec.Command("bash", "-c", cmdStr)
 
 	readHandle, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	cmd.Stderr = &errBuf
 
 	err = cmd.Start()
-	return readHandle, err
-
+	return readHandle, isSubset, err
 }
