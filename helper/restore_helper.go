@@ -7,9 +7,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
 	"github.com/greenplum-db/gpbackup/toc"
@@ -20,11 +20,60 @@ import (
 /*
  * Restore specific functions
  */
-type ReaderType int
+type ReaderType string
+const (
+	SEEKABLE ReaderType = "seekable"	// reader which supports seek
+	NONSEEKABLE			= "discard"		// reader which is not seekable
+	SUBSET				= "subset"		// reader which operates on pre filtered data
+)
 
+/* RestoreReader structure to wrap the underlying reader.
+ * readerType identifies how the reader can be used
+ * SEEKABLE uses seekReader. Used when restoring from uncompressed data with filters from local filesystem
+ * NONSEEKABLE and SUBSET types uses bufReader.
+ * SUBSET type applies when restoring using plugin(if compatible) from uncompressed data with filters
+ * NONSEEKABLE type applies for every other restore scenario
+ */
 type RestoreReader struct {
-	bufReader		*bufio.Reader
-	isSubsetReader	bool
+	bufReader  *bufio.Reader
+	seekReader io.ReadSeeker
+	readerType ReaderType
+}
+
+func (r *RestoreReader) positionReader(pos uint64) error {
+	switch r.readerType {
+	case SEEKABLE:
+		seekPosition, err := r.seekReader.Seek(int64(pos), io.SeekCurrent)
+		if err != nil {
+			// Always hard quit if data reader has issues
+			_ = utils.RemoveFileIfExists(currentPipe)
+			return err
+		}
+		log(fmt.Sprintf("Data Reader seeked forward to %d byte offset", seekPosition))
+	case NONSEEKABLE:
+		numDiscarded, err := r.bufReader.Discard(int(pos))
+		if err != nil {
+			// Always hard quit if data reader has issues
+			_ = utils.RemoveFileIfExists(currentPipe)
+			return err
+		}
+		log(fmt.Sprintf("Data Reader discarded %d bytes", numDiscarded))
+	case SUBSET:
+		// Do nothing as the stream is pre filtered
+	}
+	return nil
+}
+
+func (r *RestoreReader) copyData(num int64) (int64, error) {
+	var bytesRead int64
+	var err error
+	switch r.readerType {
+	case SEEKABLE:
+		bytesRead, err = io.CopyN(writer, r.seekReader, num)
+	case NONSEEKABLE, SUBSET:
+		bytesRead, err = io.CopyN(writer, r.bufReader, num)
+	}
+	return bytesRead, err
 }
 
 func doRestoreAgent() error {
@@ -35,7 +84,6 @@ func doRestoreAgent() error {
 	var bytesRead int64
 	var start uint64
 	var end uint64
-	var numDiscarded int
 	var errRemove error
 	var lastError error
 
@@ -48,6 +96,7 @@ func doRestoreAgent() error {
 	if err != nil {
 		return err
 	}
+	log(fmt.Sprintf("Using reader type: %s", reader.readerType))
 
 	for i, oid := range oidList {
 		if wasTerminated {
@@ -81,16 +130,13 @@ func doRestoreAgent() error {
 		}
 
 		log(fmt.Sprintf("Data Reader - Start Byte: %d; End Byte: %d; Last Byte: %d", start, end, lastByte))
-		numDiscarded, err = reader.bufReader.Discard(int(start - lastByte))
+		err = reader.positionReader(start - lastByte)
 		if err != nil {
-			// Always hard quit if data reader has issues
-			_ = utils.RemoveFileIfExists(currentPipe)
 			return err
 		}
-		log(fmt.Sprintf("Data Reader discarded %d bytes", numDiscarded))
 
 		log(fmt.Sprintf("Restoring table with oid %d", oid))
-		bytesRead, err = io.CopyN(writer, reader.bufReader, int64(end-start))
+		bytesRead, err = reader.copyData(int64(end-start))
 		if err != nil {
 			// In case COPY FROM or copyN fails in the middle of a load. We
 			// need to update the lastByte with the amount of bytes that was
@@ -132,38 +178,56 @@ func doRestoreAgent() error {
 }
 
 func getRestoreDataReader(tocEntries *toc.SegmentTOC) (*RestoreReader, error) {
-	var restoreReader *RestoreReader
 	var readHandle io.Reader
-	var isSubsetReader bool
-	var err error
+	var seekHandle io.ReadSeeker
+	var isSubset bool
+	var err error = nil
+	restoreReader := new(RestoreReader)
 
 	if *pluginConfigFile != "" {
-		readHandle, isSubsetReader, err = startRestorePluginCommand(tocEntries)
+		readHandle, isSubset, err = startRestorePluginCommand(tocEntries)
+		if isSubset {
+			// Reader that operates on subset data
+			restoreReader.readerType = SUBSET
+		} else {
+			// Regular reader which doesn't support seek
+			restoreReader.readerType = NONSEEKABLE
+		}
 	} else {
-		readHandle, err = os.Open(*dataFile)
+		if *isFilter && !strings.HasSuffix(*dataFile, ".gz") {
+			// Seekable reader if backup is not compressed and filters are set
+			seekHandle, err = os.Open(*dataFile)
+			restoreReader.readerType = SEEKABLE
+		} else {
+			// Regular reader which doesn't support seek
+			readHandle, err = os.Open(*dataFile)
+			restoreReader.readerType = NONSEEKABLE
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	var bufIoReader *bufio.Reader
-	if *compressionLevel > 0 {
+	// Set the underlying stream reader in restoreReader
+	if restoreReader.readerType == SEEKABLE {
+		restoreReader.seekReader = seekHandle
+	} else if strings.HasSuffix(*dataFile, ".gz") {
 		gzipReader, err := gzip.NewReader(readHandle)
 		if err != nil {
 			return nil, err
 		}
-		bufIoReader= bufio.NewReader(gzipReader)
+		restoreReader.bufReader = bufio.NewReader(gzipReader)
 	} else {
-		bufIoReader = bufio.NewReader(readHandle)
+		restoreReader.bufReader = bufio.NewReader(readHandle)
 	}
+
 	// Check that no error has occurred in plugin command
 	errMsg := strings.Trim(errBuf.String(), "\x00")
 	if len(errMsg) != 0 {
 		return nil, errors.New(errMsg)
 	}
-	restoreReader.bufReader = bufIoReader
-	restoreReader.isSubsetReader = isSubsetReader
-	return restoreReader, nil
+
+	return restoreReader, err
 }
 
 func getRestorePipeWriter(currentPipe string) (*bufio.Writer, *os.File, error) {
@@ -177,25 +241,30 @@ func getRestorePipeWriter(currentPipe string) (*bufio.Writer, *os.File, error) {
 }
 
 func startRestorePluginCommand(tocEntries *toc.SegmentTOC) (io.Reader, bool, error) {
+	isSubset := false
 	pluginConfig, err := utils.ReadPluginConfig(*pluginConfigFile)
 	if err != nil {
 		return nil, false, err
 	}
 	cmdStr := ""
-	isSubset := false
-	if strings.HasPrefix(pluginConfig.ExecutablePath, "gpbackup_ddboost_plugin") && *isFilter && *compressionLevel > 0 {
-		offsetsFile := fmt.Sprintf("/tmp/%s",filepath.Base(*dataFile))
-		wbuf := new(bytes.Buffer)
+	if pluginConfig.CanRestoreSubset() && *isFilter && !strings.HasSuffix(*dataFile, ".gz") {
+		offsetsFile, _ := ioutil.TempFile("/tmp", "gprestore_offsets_")
+		defer func() {
+			offsetsFile.Close()
+			os.Remove(offsetsFile.Name())
+		}()
+		buf := new(bytes.Buffer)
 		for _, entry := range tocEntries.DataEntries {
-			_ = binary.Write(wbuf, binary.LittleEndian, entry.StartByte)
-			_ = binary.Write(wbuf, binary.LittleEndian, entry.EndByte)
+			_ = binary.Write(buf, binary.LittleEndian, entry.StartByte)
+			_ = binary.Write(buf, binary.LittleEndian, entry.EndByte)
 		}
-		utils.WriteToFileAndMakeReadOnly(offsetsFile, wbuf.Bytes())
-		cmdStr = fmt.Sprintf("%s restore_data_subset %s %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile, offsetsFile)
+		offsetsFile.Write(buf.Bytes())
+		cmdStr = fmt.Sprintf("%s restore_data_subset %s %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile, offsetsFile.Name())
 		isSubset = true
 	} else {
 		cmdStr = fmt.Sprintf("%s restore_data %s %s", pluginConfig.ExecutablePath, pluginConfig.ConfigPath, *dataFile)
 	}
+	log(fmt.Sprintf("%s", cmdStr))
 	cmd := exec.Command("bash", "-c", cmdStr)
 
 	readHandle, err := cmd.StdoutPipe()
