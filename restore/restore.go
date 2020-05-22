@@ -228,8 +228,9 @@ func restorePredata(metadataFilename string) {
 				if utils.RelationIsExcludedByUser(inRelationsUserInput, exRelationsUserInput, table) {
 					tablesExcludedByUserInput = append(tablesExcludedByUserInput, table)
 				} else {
-					_, ok := existingSchemasMap[schemaName]
-					if !ok && !utils.Exists(schemasToCreate, schemaName) {
+					_, schemaExists := existingSchemasMap[schemaName]
+					preFilteredToCreate := utils.Exists(schemasToCreate, schemaName)
+					if !schemaExists && !preFilteredToCreate {
 						schemasToCreate = append(schemasToCreate, schemaName)
 					}
 					tableFQNsToCreate = append(tableFQNsToCreate, table)
@@ -250,7 +251,7 @@ func restorePredata(metadataFilename string) {
 			missing = append(missing, tableFQNsToCreate...)
 		}
 		if missing != nil {
-			err = errors.Errorf("Some objects are missing from the target database: %v", missing)
+			err = errors.Errorf("Following objects are missing from the target database: %v", missing)
 			gplog.FatalOnError(err)
 		}
 	} else { // if not incremental restore - assume database is empty and just filter based on user input
